@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Dataset files
+data/
+features/
+splits/
+*.avi
+*.mp4
+*.mov
+*.mkv
+
+# Generated features
+*.npz
+*.npy
+
+# Models / checkpoints
+checkpoints/
+*.h5
+*.weights.h5
+*.keras
+
+# Training outputs
+logs/
+results/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
