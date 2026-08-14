@@ -183,20 +183,24 @@ def evaluate_video_level(model, val_dataset, val_metadata, use_tta):
     )
 
     selected = results[selected_method]["best_validation_threshold"]
-
     return results, selected_method, selected
 
 
-class VideoMetricsPrinter(keras.callbacks.Callback):
-    """Print video-level validation metrics after every epoch."""
+class VideoMetricsCheckpoint(keras.callbacks.Callback):
+    """Evaluate and save the best video-level validation checkpoint."""
 
-    def __init__(self, val_dataset, val_metadata, use_tta):
+    def __init__(self, val_dataset, val_metadata, use_tta, checkpoint_path):
         super().__init__()
         self.val_dataset = val_dataset
         self.val_metadata = val_metadata
         self.use_tta = use_tta
+        self.checkpoint_path = Path(checkpoint_path)
         self.best_accuracy = -1.0
+        self.best_f1 = -1.0
+        self.best_auc = -1.0
         self.best_epoch = 0
+        self.best_method = None
+        self.best_result = None
 
     def on_epoch_end(self, epoch, logs=None):
         _, method, result = evaluate_video_level(
@@ -207,22 +211,50 @@ class VideoMetricsPrinter(keras.callbacks.Callback):
         )
 
         accuracy = result["accuracy"]
-        if accuracy > self.best_accuracy:
+        f1 = result["f1"]
+        auc = result["auc"]
+
+        improved = (
+            accuracy > self.best_accuracy + 1e-12
+            or (
+                abs(accuracy - self.best_accuracy) <= 1e-12
+                and f1 > self.best_f1 + 1e-12
+            )
+            or (
+                abs(accuracy - self.best_accuracy) <= 1e-12
+                and abs(f1 - self.best_f1) <= 1e-12
+                and auc > self.best_auc + 1e-12
+            )
+        )
+
+        if improved:
             self.best_accuracy = accuracy
+            self.best_f1 = f1
+            self.best_auc = auc
             self.best_epoch = epoch + 1
+            self.best_method = method
+            self.best_result = result
+            self.model.save_weights(self.checkpoint_path)
 
         print()
         print(f"Aggregation : {method}")
         print(f"Threshold   : {result['threshold']:.3f}")
-        print(f"Accuracy    : {result['accuracy'] * 100:.2f}%")
-        print(f"AUC         : {result['auc'] * 100:.2f}%")
+        print(f"Accuracy    : {accuracy * 100:.2f}%")
+        print(f"AUC         : {auc * 100:.2f}%")
         print(f"Precision   : {result['precision'] * 100:.2f}%")
         print(f"Recall      : {result['recall'] * 100:.2f}%")
-        print(f"F1-score    : {result['f1'] * 100:.2f}%")
-        print(
-            f"BEST SO FAR : {self.best_accuracy * 100:.2f}% "
-            f"(epoch {self.best_epoch})"
-        )
+        print(f"F1-score    : {f1 * 100:.2f}%")
+
+        if improved:
+            print(
+                f"BEST SO FAR : {self.best_accuracy * 100:.2f}% "
+                f"(epoch {self.best_epoch}, saved checkpoint)"
+            )
+        else:
+            print(
+                f"BEST SO FAR : {self.best_accuracy * 100:.2f}% "
+                f"(epoch {self.best_epoch})"
+            )
 
 
 def build_optimizer(learning_rate, weight_decay):
@@ -277,10 +309,10 @@ def parse_args():
     parser.add_argument(
         "--early-stopping",
         type=int,
-        default=8,
+        default=0,
         help=(
-            "Patience for clip-level validation-accuracy early stopping. "
-            "Use 0 to disable."
+            "Optional patience for clip-level validation-accuracy early "
+            "stopping. Use 0 to run every requested epoch."
         ),
     )
 
@@ -368,15 +400,14 @@ def main():
 
     model.summary()
 
+    video_checkpoint = VideoMetricsCheckpoint(
+        val_dataset,
+        val_metadata,
+        use_tta=not args.no_tta,
+        checkpoint_path=checkpoint_path,
+    )
+
     callbacks = [
-        keras.callbacks.ModelCheckpoint(
-            str(checkpoint_path),
-            monitor="val_accuracy",
-            mode="max",
-            save_best_only=True,
-            save_weights_only=True,
-            verbose=1,
-        ),
         keras.callbacks.ReduceLROnPlateau(
             monitor="val_accuracy",
             mode="max",
@@ -385,11 +416,7 @@ def main():
             min_lr=1e-6,
             verbose=1,
         ),
-        VideoMetricsPrinter(
-            val_dataset,
-            val_metadata,
-            use_tta=not args.no_tta,
-        ),
+        video_checkpoint,
         keras.callbacks.CSVLogger(str(csv_log_path)),
     ]
 
@@ -411,6 +438,9 @@ def main():
         callbacks=callbacks,
         verbose=1,
     )
+
+    if not checkpoint_path.exists():
+        raise RuntimeError("No video-level checkpoint was saved.")
 
     best_model = build_model(
         hidden_units=args.hidden_units,
@@ -438,6 +468,10 @@ def main():
         },
         "initialization": initialization,
         "epochs_requested": args.epochs,
+        "checkpoint_selection": (
+            "best video-level validation accuracy; ties by F1 then AUC"
+        ),
+        "best_epoch": video_checkpoint.best_epoch,
         "batch_size": args.batch_size,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
@@ -463,6 +497,7 @@ def main():
 
     print()
     print("FINAL BEST VIDEO-LEVEL RESULT")
+    print(f"Best epoch   : {video_checkpoint.best_epoch}")
     print(f"Aggregation  : {selected_method}")
     print(f"Accuracy     : {selected['accuracy'] * 100:.2f}%")
     print(f"AUC          : {selected['auc'] * 100:.2f}%")
