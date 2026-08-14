@@ -1,82 +1,128 @@
 # Generic 4-Conv3D RGB+Flow Video Classifier
 
-This repository contains a dataset-agnostic implementation of a binary video-classification pipeline. No dataset name, local dataset path, or dataset-specific class name is hard-coded in the training code.
+This repository contains a dataset-agnostic binary video-classification pipeline. No dataset name, local dataset path, or dataset-specific class name is hard-coded in the model or training code.
 
 ## Architecture
 
-Each model input is a `16 x 112 x 112 x 6` tensor:
+Each input clip has shape `16 x 112 x 112 x 6`:
 
 - 3 RGB channels
 - horizontal optical flow
 - vertical optical flow
 - optical-flow magnitude
 
-The classifier uses:
+The classifier uses four Conv3D blocks (64, 128, 256, 512 filters), BatchNorm, Swish, MaxPool3D, global average + max pooling, one hidden Dense layer with 1024 units, Dropout, and a two-unit SoftMax output.
 
-1. Conv3D(64) + BatchNorm + Swish + MaxPool3D
-2. Conv3D(128) + BatchNorm + Swish + MaxPool3D
-3. Conv3D(256) + BatchNorm + Swish + MaxPool3D
-4. Conv3D(512) + BatchNorm + Swish + MaxPool3D
-5. GlobalAveragePooling3D + GlobalMaxPooling3D
-6. one hidden Dense layer with 1024 units
-7. Dropout
-8. two-unit SoftMax output
+## Quickest reproducibility workflow
 
-The architecture is fixed at four Conv3D layers and one hidden fully connected layer.
+After cloning the repository and installing the Python dependencies, a complete experiment can be run from the two raw class folders with one command. The runner automatically creates the train/validation split, preprocesses every video into three RGB+flow clips, trains the model, evaluates video-level metrics, and saves the checkpoint and result JSON.
+
+```bash
+python run_experiment.py \
+  --negative-dir "/path/to/class_0" \
+  --positive-dir "/path/to/class_1" \
+  --run-name verification \
+  --epochs 20 \
+  --seed 42
+```
+
+The command above performs the complete pipeline:
+
+```text
+raw class folders
+    -> stratified train/validation split
+    -> sequential video decoding
+    -> three RGB+optical-flow clips per video
+    -> 4-Conv3D training
+    -> video-level aggregation and threshold evaluation
+    -> checkpoint + CSV training log + JSON metrics
+```
+
+Generated preprocessing data is kept under `runs/<run-name>/`. Training outputs are saved as:
+
+```text
+checkpoints/<run-name>_best.weights.h5
+logs/<run-name>_training.csv
+results/metrics/<run-name>_validation.json
+```
+
+For a quick end-to-end functionality test before a long run, use a small number of videos per class:
+
+```bash
+python run_experiment.py \
+  --negative-dir "/path/to/class_0" \
+  --positive-dir "/path/to/class_1" \
+  --run-name smoke_test \
+  --epochs 1 \
+  --batch-size 2 \
+  --smoke-videos-per-class 2 \
+  --no-augment \
+  --no-tta
+```
+
+A smoke-test score is only a software functionality check; it is not a reported experimental result.
 
 ## Environment
 
 Python 3.10 is recommended.
 
-Create and activate a fresh virtual environment:
-
 ```bash
 python3.10 -m venv venv
 source venv/bin/activate
 python -m pip install --upgrade pip
-```
-
-### CPU installation
-
-Use this when a GPU is not required:
-
-```bash
 pip install -r requirements.txt
 ```
 
-### NVIDIA GPU installation on Linux
-
-First confirm that the NVIDIA driver is visible:
-
-```bash
-nvidia-smi
-```
-
-Then install the GPU-enabled TensorFlow environment:
+For Linux systems using an NVIDIA GPU, an optional GPU dependency file is also provided:
 
 ```bash
 pip install -r requirements-gpu.txt
 ```
 
-TensorFlow 2.15 uses pip-installable NVIDIA CUDA dependencies on Linux. The GPU requirements file pins `tensorflow[and-cuda]==2.15.0.post1` so a fresh environment receives the CUDA runtime dependencies expected by TensorFlow 2.15.
+TensorRT is not required.
 
-Verify the environment before preprocessing or training:
+Verify the model implementation:
 
 ```bash
-python - <<'PY'
-import tensorflow as tf
-print("TensorFlow:", tf.__version__)
-print("GPUs:", tf.config.list_physical_devices("GPU"))
-PY
+python smoke_test.py
 ```
 
-For a GPU machine, the `GPUs` line should contain at least one physical device. TensorRT is not required for these experiments.
+Expected architecture checks include input shape `(None, 16, 112, 112, 6)`, output shape `(None, 2)`, four Conv3D layers, and two Dense layers (one hidden layer plus the SoftMax output layer).
 
-If `nvidia-smi` works but TensorFlow still reports no GPU, follow TensorFlow's pip-install troubleshooting steps for the NVIDIA shared-library links inside the virtual environment before starting a long training run.
+## Transfer learning
 
-## 1. Create a train/validation split
+The same one-command runner supports a compatible source checkpoint:
 
-The input dataset only needs two class folders. Class 0 is the negative class and class 1 is the positive class.
+```bash
+python run_experiment.py \
+  --negative-dir "/path/to/class_0" \
+  --positive-dir "/path/to/class_1" \
+  --run-name transfer_verification \
+  --init-weights "/path/to/source_best.weights.h5" \
+  --epochs 12 \
+  --learning-rate 2e-5 \
+  --seed 42
+```
+
+All layers are fine-tuned; the architecture does not change.
+
+## Evaluation
+
+After every epoch, the training script evaluates three video-level aggregation methods:
+
+- mean clip probability
+- mean of the two highest clip probabilities
+- maximum clip probability
+
+The best video-level validation checkpoint is selected by validation accuracy, with F1 and AUC used as tie-breakers. The result JSON stores the aggregation results, the selected validation aggregation method, threshold, accuracy, AUC, precision, recall, and F1 score.
+
+A threshold selected on the validation set is a validation/model-selection result and should not be described as untouched test-set performance.
+
+## Manual workflow (advanced)
+
+The one-command runner simply orchestrates the reusable generic modules. They can also be run separately when needed.
+
+Create a split:
 
 ```bash
 python -m preprocessing.prepare_dataset \
@@ -87,36 +133,21 @@ python -m preprocessing.prepare_dataset \
   --seed 42
 ```
 
-This creates:
-
-```text
-datasets/splits/train.csv
-datasets/splits/val.csv
-```
-
-## 2. Preprocess the training split
-
-The preprocessor sequentially decodes each video, which is more reliable than seeking directly to arbitrary frame numbers for videos with imperfect codec metadata.
+Preprocess training and validation videos:
 
 ```bash
 python -m preprocessing.rgb_flow_preprocessing \
   --manifest datasets/splits/train.csv \
   --output-dir features/train \
   --output-manifest datasets/splits/train_rgbflow.csv
-```
 
-## 3. Preprocess the validation split
-
-```bash
 python -m preprocessing.rgb_flow_preprocessing \
   --manifest datasets/splits/val.csv \
   --output-dir features/val \
   --output-manifest datasets/splits/val_rgbflow.csv
 ```
 
-For each successfully decoded video, the preprocessor creates three temporal clips. Each clip contains 16 frames and has shape `(16, 112, 112, 6)`.
-
-## 4. Train from scratch
+Train directly from the generated manifests:
 
 ```bash
 python -m training.train \
@@ -132,69 +163,24 @@ python -m training.train \
   --seed 42
 ```
 
-The terminal prints clip-level Keras metrics and video-level validation metrics after every epoch.
-
-Outputs are saved as:
-
-```text
-checkpoints/<output-prefix>_best.weights.h5
-logs/<output-prefix>_training.csv
-results/metrics/<output-prefix>_validation.json
-```
-
-## 5. Transfer learning
-
-The same script supports transfer learning from any checkpoint produced by the same architecture.
-
-```bash
-python -m training.train \
-  --train-manifest datasets/splits/train_rgbflow.csv \
-  --val-manifest datasets/splits/val_rgbflow.csv \
-  --init-weights /path/to/source_best.weights.h5 \
-  --output-prefix transfer_run \
-  --epochs 12 \
-  --learning-rate 2e-5 \
-  --seed 42
-```
-
-All layers are fine-tuned. The architecture does not change.
-
-## Evaluation
-
-Three video-level aggregation methods are evaluated:
-
-- mean
-- mean of the two highest clip probabilities
-- maximum clip probability
-
-The JSON result contains both the result at threshold `0.5` and the best threshold selected on the validation set.
-
-A threshold selected on the validation set is a validation/model-selection result. It should not be described as untouched test-set performance.
-
 ## Reproducibility notes
 
-- Keep the same split CSVs when comparing training configurations.
-- Keep the seed fixed when reproducing a run.
-- GPU kernels can still introduce small run-to-run variation.
-- Do not rename or move generated feature files after preprocessing because the feature manifest stores their paths.
-- Checkpoints are intentionally ignored by Git because they are large. A source checkpoint used for transfer learning should be supplied separately or reproduced first.
+- Use the same raw dataset version and the same seed when reproducing a generated split.
+- Preserve any official or source-disjoint split required by a specific experiment rather than regenerating it with a simple random split.
+- GPU kernels can introduce small run-to-run variation.
+- Generated features can require substantial disk space and preprocessing time.
+- Checkpoints are intentionally ignored by Git because of their size. A transfer-learning checkpoint must be provided separately or reproduced first.
+- The raw datasets are not distributed in this repository; the user must obtain them from their original sources.
 
-## Quick checks
-
-Syntax check:
+## Quick syntax check
 
 ```bash
 python -m py_compile \
+  run_experiment.py \
   models/four_conv3d.py \
   datasets/rgb_flow_dataset.py \
   preprocessing/prepare_dataset.py \
   preprocessing/rgb_flow_preprocessing.py \
   training/train.py \
   smoke_test.py
-```
-
-Model smoke test:
-
-```bash
-python smoke_test.py
 ```
