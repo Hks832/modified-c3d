@@ -28,14 +28,39 @@ The architecture is fixed at four Conv3D layers and one hidden fully connected l
 
 Python 3.10 is recommended.
 
+Create and activate a fresh virtual environment:
+
 ```bash
 python3.10 -m venv venv
 source venv/bin/activate
 python -m pip install --upgrade pip
+```
+
+### CPU installation
+
+Use this when a GPU is not required:
+
+```bash
 pip install -r requirements.txt
 ```
 
-Verify TensorFlow before a long run:
+### NVIDIA GPU installation on Linux
+
+First confirm that the NVIDIA driver is visible:
+
+```bash
+nvidia-smi
+```
+
+Then install the GPU-enabled TensorFlow environment:
+
+```bash
+pip install -r requirements-gpu.txt
+```
+
+TensorFlow 2.15 uses pip-installable NVIDIA CUDA dependencies on Linux. The GPU requirements file pins `tensorflow[and-cuda]==2.15.0.post1` so a fresh environment receives the CUDA runtime dependencies expected by TensorFlow 2.15.
+
+Verify the environment before preprocessing or training:
 
 ```bash
 python - <<'PY'
@@ -45,7 +70,9 @@ print("GPUs:", tf.config.list_physical_devices("GPU"))
 PY
 ```
 
-The repository pins TensorFlow 2.15.0. TensorRT is not required.
+For a GPU machine, the `GPUs` line should contain at least one physical device. TensorRT is not required for these experiments.
+
+If `nvidia-smi` works but TensorFlow still reports no GPU, follow TensorFlow's pip-install troubleshooting steps for the NVIDIA shared-library links inside the virtual environment before starting a long training run.
 
 ## 1. Create a train/validation split
 
