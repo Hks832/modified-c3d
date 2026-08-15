@@ -1,4 +1,4 @@
-# Generic 4-Conv3D RGB+Flow Video Classifier
+
 
 This repository contains a dataset-agnostic binary video-classification pipeline. No dataset name, local dataset path, or dataset-specific class name is hard-coded in the model or training code.
 
@@ -89,7 +89,6 @@ python smoke_test.py
 
 Expected architecture checks include input shape `(None, 16, 112, 112, 6)`, output shape `(None, 2)`, four Conv3D layers, and two Dense layers (one hidden layer plus the SoftMax output layer).
 
-## Transfer learning
 
 The same one-command runner supports a compatible source checkpoint:
 
@@ -116,7 +115,7 @@ After every epoch, the training script evaluates three video-level aggregation m
 
 The best video-level validation checkpoint is selected by validation accuracy, with F1 and AUC used as tie-breakers. The result JSON stores the aggregation results, the selected validation aggregation method, threshold, accuracy, AUC, precision, recall, and F1 score.
 
-A threshold selected on the validation set is a validation/model-selection result and should not be described as untouched test-set performance.
+
 
 ## Manual workflow (advanced)
 
