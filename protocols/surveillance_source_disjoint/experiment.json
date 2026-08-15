@@ -37,7 +37,7 @@
   "initialization": {
     "requires_init_weights": true,
     "note": "RWF-2000 pretrained 4-Conv3D RGB+Flow checkpoint; all layers fine-tuned",
-    "checkpoint_filename_at_export": "rwf2000_4conv_multiclip_softmax_best_auc.weights.h5",
+    "checkpoint_filename_at_export": "pretrained_4conv_rgbflow.weights.h5",
     "checkpoint_sha256": "8d6df38b8f9bc09867556ffe40a66b46adf3c31aa0f7739049df5c354bad4a87"
   },
   "files": {
