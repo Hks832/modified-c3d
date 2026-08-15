@@ -17,6 +17,14 @@ PATH_COLUMNS = (
 )
 
 
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def find_path_column(df: pd.DataFrame) -> str:
     for column in PATH_COLUMNS:
         if column in df.columns:
@@ -42,36 +50,34 @@ def resolve_paths(df: pd.DataFrame, manifest_path: Path):
                 (candidate for candidate in candidates if candidate.exists()),
                 candidates[0],
             )
-        paths.append(path.resolve())
+        path = path.resolve()
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        paths.append(path)
 
     return path_column, paths
-
-
-def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def portable_split(
     source_df: pd.DataFrame,
     source_manifest: Path,
     dataset_root: Path,
+    split_name: str,
 ):
     if "label" not in source_df.columns:
         raise KeyError(f"{source_manifest} has no 'label' column")
 
     _, paths = resolve_paths(source_df, source_manifest)
     rows = []
-
     source_group_column = (
         "source_group" if "source_group" in source_df.columns else None
     )
 
+    print(f"Hashing {split_name} videos for dataset fingerprinting...")
+
     for row_index, (path, label) in enumerate(
-        zip(paths, source_df["label"].astype(int))
+        zip(paths, source_df["label"].astype(int)),
+        start=1,
     ):
         try:
             relative = path.relative_to(dataset_root)
@@ -84,14 +90,18 @@ def portable_split(
         item = {
             "relative_path": relative.as_posix(),
             "label": int(label),
+            "file_sha256": sha256(path),
         }
 
         if source_group_column is not None:
             item["source_group"] = str(
-                source_df.iloc[row_index][source_group_column]
+                source_df.iloc[row_index - 1][source_group_column]
             )
 
         rows.append(item)
+
+        if row_index % 50 == 0 or row_index == len(paths):
+            print(f"  {row_index}/{len(paths)} {split_name} videos hashed")
 
     return pd.DataFrame(rows)
 
@@ -111,9 +121,8 @@ def parse_args():
         type=Path,
         default=None,
         help=(
-            "Root directory that should be replaced by --dataset-root on "
-            "another machine. If omitted, a common root is inferred from "
-            "all train/validation video paths."
+            "Root directory replaced by --dataset-root on another machine. "
+            "If omitted, a common root is inferred."
         ),
     )
     parser.add_argument("--epochs", type=int, default=20)
@@ -130,7 +139,16 @@ def parse_args():
     parser.add_argument(
         "--requires-init-weights",
         action="store_true",
-        help="Mark this protocol as requiring a compatible source checkpoint.",
+        help="Mark this protocol as requiring source checkpoint weights.",
+    )
+    parser.add_argument(
+        "--init-weights",
+        type=Path,
+        default=None,
+        help=(
+            "Exact source checkpoint used by the experiment. Its SHA-256 is "
+            "stored in experiment.json; the checkpoint itself is not copied."
+        ),
     )
     parser.add_argument(
         "--initialization-note",
@@ -163,15 +181,35 @@ def main():
     else:
         dataset_root = args.dataset_root.expanduser().resolve()
 
+    if not dataset_root.is_dir():
+        raise NotADirectoryError(dataset_root)
+
+    init_weights = None
+    init_hash = None
+    if args.init_weights is not None:
+        init_weights = args.init_weights.expanduser().resolve()
+        if not init_weights.is_file():
+            raise FileNotFoundError(init_weights)
+        print("Hashing initialization checkpoint...")
+        init_hash = sha256(init_weights)
+
+    if args.requires_init_weights and init_weights is None:
+        raise RuntimeError(
+            "--requires-init-weights also requires --init-weights so the "
+            "exact source checkpoint can be fingerprinted."
+        )
+
     train_protocol = portable_split(
         train_df,
         train_manifest,
         dataset_root,
+        "train",
     )
     val_protocol = portable_split(
         val_df,
         val_manifest,
         dataset_root,
+        "validation",
     )
 
     train_paths_set = set(train_protocol["relative_path"])
@@ -206,8 +244,9 @@ def main():
     val_protocol.to_csv(val_path, index=False)
 
     config = {
-        "protocol_version": 1,
+        "protocol_version": 2,
         "portable_dataset_root_from_export_machine": str(dataset_root),
+        "dataset_video_hashes": "sha256 per file in train.csv and val.csv",
         "train_videos": int(len(train_protocol)),
         "validation_videos": int(len(val_protocol)),
         "train_class_counts": {
@@ -243,27 +282,32 @@ def main():
         "initialization": {
             "requires_init_weights": args.requires_init_weights,
             "note": args.initialization_note,
+            "checkpoint_filename_at_export": (
+                init_weights.name if init_weights is not None else None
+            ),
+            "checkpoint_sha256": init_hash,
         },
     }
 
-    config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
-
-    # Hash after writing so the exact split membership can be verified later.
     config["files"] = {
         "train_csv_sha256": sha256(train_path),
         "val_csv_sha256": sha256(val_path),
     }
     config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
+    print()
     print("Portable protocol exported.")
     print("Dataset root used:", dataset_root)
     print("Train videos:", len(train_protocol))
     print("Validation videos:", len(val_protocol))
+    print("Source-group overlap:", len(source_group_overlap))
     print("Train CSV:", train_path)
     print("Validation CSV:", val_path)
     print("Configuration:", config_path)
     print("Train SHA256:", config["files"]["train_csv_sha256"])
     print("Validation SHA256:", config["files"]["val_csv_sha256"])
+    if init_hash:
+        print("Initialization checkpoint SHA256:", init_hash)
 
 
 if __name__ == "__main__":
