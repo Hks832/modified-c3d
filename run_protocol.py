@@ -27,7 +27,7 @@ def run_command(parts):
     subprocess.run(parts, cwd=ROOT, check=True)
 
 
-def load_protocol_split(path: Path, dataset_root: Path):
+def load_protocol_split(path: Path, dataset_root: Path, split_name: str):
     df = pd.read_csv(path)
     required = {"relative_path", "label"}
     missing = required - set(df.columns)
@@ -38,21 +38,35 @@ def load_protocol_split(path: Path, dataset_root: Path):
 
     rows = []
     missing_files = []
+    hash_mismatches = []
+    verify_hashes = "file_sha256" in df.columns
 
-    for row in df.itertuples(index=False):
+    if verify_hashes:
+        print(f"Verifying {split_name} dataset fingerprints...")
+
+    for index, row in enumerate(df.itertuples(index=False), start=1):
         video_path = (dataset_root / str(row.relative_path)).resolve()
+
         if not video_path.is_file():
             missing_files.append(str(video_path))
+        elif verify_hashes:
+            expected_hash = str(row.file_sha256).strip().lower()
+            actual_hash = sha256(video_path)
+            if actual_hash != expected_hash:
+                hash_mismatches.append(
+                    (str(row.relative_path), expected_hash, actual_hash)
+                )
 
         item = {
             "video_path": str(video_path),
             "label": int(row.label),
         }
-
         if hasattr(row, "source_group"):
             item["source_group"] = str(row.source_group)
-
         rows.append(item)
+
+        if verify_hashes and (index % 50 == 0 or index == len(df)):
+            print(f"  {index}/{len(df)} {split_name} videos verified")
 
     if missing_files:
         preview = "\n".join(missing_files[:10])
@@ -61,14 +75,25 @@ def load_protocol_split(path: Path, dataset_root: Path):
             f"dataset root {dataset_root}. First missing paths:\n{preview}"
         )
 
-    return pd.DataFrame(rows)
+    if hash_mismatches:
+        preview = "\n".join(
+            f"{path}\n expected {expected}\n actual   {actual}"
+            for path, expected, actual in hash_mismatches[:5]
+        )
+        raise RuntimeError(
+            f"{len(hash_mismatches)} {split_name} video SHA256 mismatch(es). "
+            f"The local dataset is not byte-identical to the frozen protocol.\n"
+            f"First mismatch(es):\n{preview}"
+        )
+
+    return pd.DataFrame(rows), verify_hashes
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Reproduce a frozen experimental protocol using version-controlled "
-            "train/validation membership and experiment settings."
+            "split membership, dataset fingerprints and experiment settings."
         )
     )
     parser.add_argument("--protocol-dir", required=True, type=Path)
@@ -97,26 +122,32 @@ def main():
     for path in (train_protocol_path, val_protocol_path, config_path):
         if not path.is_file():
             raise FileNotFoundError(path)
-
     if not dataset_root.is_dir():
         raise NotADirectoryError(dataset_root)
 
     config = json.loads(config_path.read_text(encoding="utf-8"))
     expected_files = config.get("files", {})
 
-    expected_train_hash = expected_files.get("train_csv_sha256")
-    expected_val_hash = expected_files.get("val_csv_sha256")
-
     actual_train_hash = sha256(train_protocol_path)
     actual_val_hash = sha256(val_protocol_path)
+    expected_train_hash = expected_files.get("train_csv_sha256")
+    expected_val_hash = expected_files.get("val_csv_sha256")
 
     if expected_train_hash and actual_train_hash != expected_train_hash:
         raise RuntimeError("train.csv SHA256 does not match experiment.json")
     if expected_val_hash and actual_val_hash != expected_val_hash:
         raise RuntimeError("val.csv SHA256 does not match experiment.json")
 
-    train_df = load_protocol_split(train_protocol_path, dataset_root)
-    val_df = load_protocol_split(val_protocol_path, dataset_root)
+    train_df, train_data_hashed = load_protocol_split(
+        train_protocol_path,
+        dataset_root,
+        "train",
+    )
+    val_df, val_data_hashed = load_protocol_split(
+        val_protocol_path,
+        dataset_root,
+        "validation",
+    )
 
     train_paths = set(train_df["video_path"])
     val_paths = set(val_df["video_path"])
@@ -126,6 +157,7 @@ def main():
             f"Frozen protocol has {len(overlap)} train/validation video overlaps."
         )
 
+    source_overlap = set()
     if (
         "source_group" in train_df.columns
         and "source_group" in val_df.columns
@@ -154,7 +186,11 @@ def main():
     preprocessing = config.get("preprocessing", {})
     initialization = config.get("initialization", {})
 
-    epochs = args.epochs if args.epochs is not None else int(training.get("epochs", 20))
+    epochs = (
+        args.epochs
+        if args.epochs is not None
+        else int(training.get("epochs", 20))
+    )
     batch_size = (
         args.batch_size
         if args.batch_size is not None
@@ -175,15 +211,34 @@ def main():
     flow_clip = float(preprocessing.get("flow_clip", 12.0))
 
     requires_init = bool(initialization.get("requires_init_weights", False))
+    expected_init_hash = initialization.get("checkpoint_sha256")
     init_weights = None
+    actual_init_hash = None
+
     if args.init_weights is not None:
         init_weights = args.init_weights.expanduser().resolve()
         if not init_weights.is_file():
             raise FileNotFoundError(init_weights)
+        print("Verifying initialization checkpoint...")
+        actual_init_hash = sha256(init_weights)
+        if expected_init_hash and actual_init_hash != expected_init_hash:
+            raise RuntimeError(
+                "Initialization checkpoint SHA256 does not match the frozen "
+                "protocol.\n"
+                f"Expected: {expected_init_hash}\n"
+                f"Actual:   {actual_init_hash}"
+            )
     elif requires_init:
         raise RuntimeError(
-            "This protocol requires a compatible source checkpoint. "
+            "This protocol requires the exact compatible source checkpoint. "
             "Pass it with --init-weights."
+        )
+
+    if requires_init and not expected_init_hash:
+        print(
+            "WARNING: this older protocol requires initialization weights but "
+            "does not contain a checkpoint SHA256. Re-export it with the "
+            "current tools for exact checkpoint verification."
         )
 
     run_name = args.run_name or protocol_dir.name
@@ -203,8 +258,13 @@ def main():
     metadata = {
         "protocol_dir": str(protocol_dir),
         "dataset_root": str(dataset_root),
+        "protocol_version": config.get("protocol_version"),
         "train_protocol_sha256": actual_train_hash,
         "val_protocol_sha256": actual_val_hash,
+        "dataset_file_hashes_verified": bool(
+            train_data_hashed and val_data_hashed
+        ),
+        "source_group_overlap": len(source_overlap),
         "train_videos": len(train_df),
         "validation_videos": len(val_df),
         "training": {
@@ -225,6 +285,8 @@ def main():
         "initialization": {
             "requires_init_weights": requires_init,
             "provided_init_weights": str(init_weights) if init_weights else None,
+            "expected_checkpoint_sha256": expected_init_hash,
+            "actual_checkpoint_sha256": actual_init_hash,
             "note": initialization.get("note", ""),
         },
     }
@@ -233,13 +295,23 @@ def main():
         encoding="utf-8",
     )
 
+    print()
     print("Frozen protocol verified.")
     print("Protocol:", protocol_dir)
     print("Dataset root:", dataset_root)
     print("Train videos:", len(train_df))
     print("Validation videos:", len(val_df))
-    print("Train SHA256:", actual_train_hash)
-    print("Validation SHA256:", actual_val_hash)
+    print("Video overlap: 0")
+    if "source_group" in train_df.columns and "source_group" in val_df.columns:
+        print("Source-group overlap: 0")
+    print("Train CSV SHA256:", actual_train_hash)
+    print("Validation CSV SHA256:", actual_val_hash)
+    print(
+        "Raw video SHA256 verification:",
+        "passed" if train_data_hashed and val_data_hashed else "not present",
+    )
+    if actual_init_hash:
+        print("Initialization checkpoint SHA256:", actual_init_hash)
 
     preprocess_extra = ["--flow-clip", str(flow_clip)]
     if args.overwrite_features:
