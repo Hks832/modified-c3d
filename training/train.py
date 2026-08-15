@@ -436,7 +436,7 @@ def main():
         validation_data=val_dataset,
         epochs=args.epochs,
         callbacks=callbacks,
-        verbose=1,
+        verbose=0,
     )
 
     if not checkpoint_path.exists():
